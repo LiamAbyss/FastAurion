@@ -12,8 +12,6 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 import android.view.GestureDetector;
 import android.view.Menu;
@@ -22,21 +20,22 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Toast;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 
 import org.json.JSONArray;
 import org.json.JSONException;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
+import java.util.Stack;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
-import java.util.concurrent.locks.Lock;
 
 import fr.yncrea.scorpion.api.Aurion;
 import fr.yncrea.scorpion.api.GithubService;
@@ -46,14 +45,17 @@ import fr.yncrea.scorpion.ui.fragments.CoursesFragment;
 import fr.yncrea.scorpion.utils.Constants;
 import fr.yncrea.scorpion.utils.Course;
 import fr.yncrea.scorpion.utils.PreferenceUtils;
+import fr.yncrea.scorpion.utils.StackableRequest;
 import fr.yncrea.scorpion.utils.UtilsMethods;
 import retrofit2.Response;
 import retrofit2.Retrofit;
 import retrofit2.converter.gson.GsonConverterFactory;
 
 public class MainActivity extends AppCompatActivity implements GestureDetector.OnGestureListener {
-    private Executor mExecutorFling = Executors.newSingleThreadExecutor();
-    private Executor mExecutorGit = Executors.newSingleThreadExecutor();
+    private Executor mExecutorDatabase = Executors.newSingleThreadExecutor();
+    private Executor addExecutor = Executors.newSingleThreadExecutor();
+    private Executor computeExecutor = Executors.newSingleThreadExecutor();
+    private Stack<StackableRequest> requestStack = new Stack<>();
     private Aurion mAurion = new Aurion();
     private GithubService mGithubService;
     private List<Course> mCourses;
@@ -87,12 +89,13 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
         // GestureDetector.OnGestureListener
         mDetector = new GestureDetectorCompat(this,this);
 
-        mExecutorFling.execute(() -> {
+        mExecutorDatabase.execute(() -> {
             db = Room.databaseBuilder(getApplicationContext(), ScorpionDatabase.class, "Scorpion.db").build();
             getSupportFragmentManager().beginTransaction().add(R.id.container, mCoursesFragment, "planning").commit();
-            runOnUiThread(() -> mCoursesFragment.setRefreshing(true));
-            requestPlanning(weekIndex, false, true);
-            runOnUiThread(() -> mCoursesFragment.setRefreshing(false));
+            computeRequests();
+            addRequestToStack(weekIndex, false, true);
+            addRequestToStack(weekIndex + 1, false, false);
+            addRequestToStack(weekIndex - 1, false, false);
         });
 
         findViewById(R.id.toTheLeftButton).setOnClickListener(new View.OnClickListener() {
@@ -112,12 +115,10 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
         findViewById(R.id.todaybutton).setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                mExecutorFling.execute(() -> {
-                    weekIndex = Calendar.getInstance().get(Calendar.WEEK_OF_YEAR);
-                    if(lastWeekShown < weekIndex) animationType = 1;
-                    else animationType = -1;
-                    showWeek(weekIndex);
-                });
+                weekIndex = Calendar.getInstance().get(Calendar.WEEK_OF_YEAR);
+                if(lastWeekShown < weekIndex) animationType = 1;
+                else animationType = -1;
+                showWeek(weekIndex);
             }
         });
 
@@ -135,7 +136,7 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
     }
 
     public void requestUpdate() {
-        mExecutorGit.execute(() -> {
+        //mExecutorGit.execute(() -> {
             try {
                 Response<JsonArray> releases = mGithubService.getReleases().execute();
                 String latestVersion = releases.body().get(0).getAsJsonObject().get("tag_name").getAsString();
@@ -167,9 +168,55 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
             } catch (IOException e) {
                 e.printStackTrace();
             }
-    });
+        //});
     }
 
+    public void addRequestToStack(Integer week, boolean forceRequest, boolean mustDraw) {
+        addExecutor.execute(() -> {
+            if(!mustDraw) {
+                requestStack.add(requestStack.size() - 1, new StackableRequest(week, forceRequest, mustDraw));
+            }
+            else {
+                requestStack.push(new StackableRequest(week, forceRequest, mustDraw));
+                if(forceRequest || db.aurionPlanningDao().getPlanningById(week) == null)
+                    runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(true));
+            }
+        });
+    }
+
+    private void computeRequests() {
+        computeExecutor.execute(() -> {
+            while(requestStack.isEmpty()) {
+                try {
+                    Thread.sleep(250);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+            while(!requestStack.isEmpty()) {
+                StackableRequest req = requestStack.pop();
+                requestPlanning(req.getWeek(), req.isForceRequest(), req.isMustDraw());
+                if(req.isMustDraw()) runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(false));
+                while(requestStack.isEmpty()) {
+                    try {
+                        Thread.sleep(250);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        });
+    }
+    
+    public boolean isInternetAvailable() {
+        try {
+            InetAddress address = InetAddress.getByName("www.google.com");
+            return !address.equals("");
+        } catch (UnknownHostException e) {
+            // Log error
+        }
+        return false;
+    }
     public void requestPlanning(int index, boolean forceRequest, boolean mustDraw) {
 
         Planning planning = db.aurionPlanningDao().getPlanningById(index);
@@ -226,42 +273,44 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
     }
 
     public void showWeek(int index) {
-        Planning planning = db.aurionPlanningDao().getPlanningById(index);
-        int enterAnim;
-        int exitAnim;
-        if(animationType == 1) {
-            enterAnim = R.anim.slide_in_from_right;
-            exitAnim = R.anim.slide_out_from_right;
-        }
-        else {
-            enterAnim = R.anim.slide_in_from_left;
-            exitAnim = R.anim.slide_out_from_left;
-        }
-        if(planning != null) {
-            mCourses = UtilsMethods.planningFromString(planning.toString());
-            if(lastWeekShown == index) {
-                runOnUiThread(() -> getCurrentCoursesFragment().onCoursesRetrieved(mCourses));
-            }
-            else if(isOtherFragment) {
-                mCoursesFragment = new CoursesFragment();
-                getSupportFragmentManager().beginTransaction()
-                        .setCustomAnimations(enterAnim, exitAnim)
-                        .replace(R.id.container, mCoursesFragment, "planning")
-                        .commit();
-                runOnUiThread(() -> mCoursesFragment.onCoursesRetrieved(mCourses));
-                isOtherFragment = false;
+        mExecutorDatabase.execute(() -> {
+            Planning planning = db.aurionPlanningDao().getPlanningById(index);
+            int enterAnim;
+            int exitAnim;
+            if(animationType == 1) {
+                enterAnim = R.anim.slide_in_from_right;
+                exitAnim = R.anim.slide_out_from_right;
             }
             else {
-                mOtherCoursesFragment = new CoursesFragment();
-                getSupportFragmentManager().beginTransaction()
-                        .setCustomAnimations(enterAnim, exitAnim)
-                        .replace(R.id.container, mOtherCoursesFragment, "planning")
-                        .commit();
-                runOnUiThread(() -> mOtherCoursesFragment.onCoursesRetrieved(mCourses));
-                isOtherFragment = true;
+                enterAnim = R.anim.slide_in_from_left;
+                exitAnim = R.anim.slide_out_from_left;
             }
-        }
-        lastWeekShown = index;
+            if(planning != null) {
+                mCourses = UtilsMethods.planningFromString(planning.toString());
+                if(lastWeekShown == index) {
+                    runOnUiThread(() -> getCurrentCoursesFragment().onCoursesRetrieved(mCourses));
+                }
+                else if(isOtherFragment) {
+                    mCoursesFragment = new CoursesFragment();
+                    getSupportFragmentManager().beginTransaction()
+                            .setCustomAnimations(enterAnim, exitAnim)
+                            .replace(R.id.container, mCoursesFragment, "planning")
+                            .commit();
+                    runOnUiThread(() -> mCoursesFragment.onCoursesRetrieved(mCourses));
+                    isOtherFragment = false;
+                }
+                else {
+                    mOtherCoursesFragment = new CoursesFragment();
+                    getSupportFragmentManager().beginTransaction()
+                            .setCustomAnimations(enterAnim, exitAnim)
+                            .replace(R.id.container, mOtherCoursesFragment, "planning")
+                            .commit();
+                    runOnUiThread(() -> mOtherCoursesFragment.onCoursesRetrieved(mCourses));
+                    isOtherFragment = true;
+                }
+            }
+            lastWeekShown = index;
+        });
     }
 
     public boolean connect() {
@@ -282,19 +331,9 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
     public void refresh() {
         //Refresh the planning
         Log.d("REFRESH", "Refreshing...");
-        if(isOtherFragment) {
-            runOnUiThread(() -> mOtherCoursesFragment.setRefreshing(true));
-        }
-        else {
-            runOnUiThread(() -> mCoursesFragment.setRefreshing(true));
-        }
-        requestPlanning(weekIndex, true, true);
-        if(isOtherFragment) {
-            runOnUiThread(() -> mOtherCoursesFragment.setRefreshing(false));
-        }
-        else {
-            runOnUiThread(() -> mCoursesFragment.setRefreshing(false));
-        }
+        addRequestToStack(weekIndex, true, true);
+        addRequestToStack(weekIndex + 1, false, false);
+        addRequestToStack(weekIndex - 1, false, false);
         Log.d("REFRESH", "Finish refreshing...");
     }
 
@@ -315,13 +354,11 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
             return true;
         }
         else if( id == R.id.actionRefresh) {
-            mExecutorFling.execute(() -> {
-                refresh();
-            });
+            refresh();
             return true;
         }
         else if( id == R.id.actionReset) {
-            mExecutorFling.execute(() -> {
+            mExecutorDatabase.execute(() -> {
                 db.clearAllTables();
                 weekIndex = Calendar.getInstance().get(Calendar.WEEK_OF_YEAR);
                 refresh();
@@ -381,31 +418,33 @@ public class MainActivity extends AppCompatActivity implements GestureDetector.O
     }
 
     public void toTheRight() {
-        mExecutorFling.execute(() -> {
+        //mExecutorFling.execute(() -> {
             weekIndex++;
             animationType = 1;
-            runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(true));
-            requestPlanning(weekIndex, false, true);
-            runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(false));
+            //runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(true));
+            addRequestToStack(weekIndex, false, true);
+            addRequestToStack(weekIndex + 1, false, false);
+            //runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(false));
             /*mExecutor.execute(() -> {
                 requestPlanning(weekIndex + 1, false, false);
                 //requestPlanning(weekIndex - 1, false, false);
             });*/
-        });
+        //});
     }
 
     public void toTheLeft() {
-        mExecutorFling.execute(() -> {
+        //mExecutorFling.execute(() -> {
             animationType = -1;
             weekIndex--;
-            runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(true));
-            requestPlanning(weekIndex, false, true);
-            runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(false));
+            //runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(true));
+            addRequestToStack(weekIndex, false, true);
+            addRequestToStack(weekIndex - 1, false, false);
+            //runOnUiThread(() -> getCurrentCoursesFragment().setRefreshing(false));
             /*mExecutor.execute(() -> {
                 //requestPlanning(weekIndex + 1, false, false);
                 requestPlanning(weekIndex - 1, false, false);
             });*/
-        });
+        //});
     }
 
     @Override
